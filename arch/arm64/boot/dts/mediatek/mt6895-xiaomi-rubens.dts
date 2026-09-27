@@ -37,8 +37,80 @@
 		 * device_links_write_lock(), stalling every later device-link/PM
 		 * user - including the connectivity stack's runtime-PM power-on.
 		 * Only a timeout > 0 schedules that work.
+		 *
+		 * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27) -- rationale in
+		 * /home/ubuntu/rubens-port/PLAN-UBUNTU-2604.md:
+		 *
+		 *   console=ttyGS0  added.  These bootargs are the ONLY kernel
+		 *     command line that takes effect: arch/arm64/kernel/setup.c
+		 *     overrides LK's FDT with this embedded DTB and re-reads
+		 *     /chosen/bootargs from it, so LK's own cmdline (and any
+		 *     boot.img cmdline) is discarded.  With console=tty0 alone the
+		 *     kernel is completely blind whenever the panel driver does not
+		 *     come up.  ttyGS0 comes from the built-in g_serial gadget
+		 *     (CONFIG_USB_G_SERIAL=y), needs no configfs setup, and is the
+		 *     intended bring-up console -- setup.c's own comment names
+		 *     console=ttyGS0.
+		 *
+		 *   softlockup_panic / hardlockup_panic / panic_on_oops removed.
+		 *     Bring-up has to show the failure, not reboot through it.
+		 *     With panic_on_oops=1 every oops became a silent reboot and
+		 *     the panel showed nothing; both detectors now only warn.
+		 *
+		 *   keep_bootcon added so the boot console is not unregistered
+		 *     when the real console takes over.
+		 *
+		 *   panic=30 added so a panic does not reboot instantly.  The
+		 *     previous attempt showed the gadget console coming up and the
+		 *     device then falling back to Android, but the boot log ring on
+		 *     the oops partition was empty, so nothing was recorded.  A
+		 *     delayed reboot keeps the panic message on the serial console
+		 *     and on the panel long enough to be read and captured.
+		 *
+		 *   deferred_probe_timeout=0 REMOVED.  This is the prime suspect
+		 *     for the port never reaching userspace.  deferred_probe_timeout
+		 *     is what schedules the deferred-probe workqueue: with a value
+		 *     > 0, devices whose dependencies were not ready at first probe
+		 *     are retried (fw_devlink / device_links are only settled by
+		 *     that pass).  Forcing 0 means "never retry", so every device
+		 *     that probed before its supplier -- the DSI panel, UFS, the
+		 *     touch controller, the PMIC regulators -- stays dead.  The
+		 *     comment upstream left says the timeout path Oopses; a
+		 *     deferred-probe Oops at late_initcall would also explain a
+		 *     silent reset right after driver init, with nothing in the
+		 *     bootlog record.  Let the default apply and see which happens.
+		 *
+		 *   ignore_loglevel added: print every message to the console
+		 *     regardless of its level, so a quiet-but-alive kernel cannot be
+		 *     mistaken for a dead one.
+		 *
+		 *   *** console=ttyGS0 REMOVED -- THIS WAS THE BUG. ***
+		 *
+		 *     mt6895-xiaomi-xaga.dts:39-42 already documents it, and the
+		 *     rubens board file inherited the mistake:
+		 *
+		 *       "NOTE: console=ttyGS0 is DELIBERATELY absent -- its
+		 *        CON_PRINTBUFFER console kept replaying the whole ring (USB
+		 *        re-enumeration), looping the log and stalling boot.  The
+		 *        cinit shell still works (it writes directly to /dev/ttyGS0,
+		 *        no console param needed)."
+		 *
+		 *     That is exactly the observed failure: the kernel boots, brings
+		 *     up the g_serial gadget (ttyACM0 appears on the host for ~4 s),
+		 *     the console replays the ring, USB re-enumerates, the log loops
+		 *     and the boot stalls until the watchdog/LK resets the device.
+		 *     No panic, no output captured, and the reset comes too early for
+		 *     the oops-partition bootlog to flush -- every symptom matches.
+		 *
+		 *     keep_bootcon goes with it: it exists to keep a boot console
+		 *     alive across the real console taking over, which is the same
+		 *     replay mechanism.
+		 *
+		 *     The rescue shell still works: tools/rubens-rootfs-init.sh
+		 *     spawns it by writing directly to /dev/ttyGS0, which needs no
+		 *     console= parameter at all.
 		 */
-			bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 printk.devkmsg=on log_buf_len=2M consoleblank=0 deferred_probe_timeout=0 softlockup_panic=1 hardlockup_panic=1 panic_on_oops=1";
+		bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 panic=30 printk.devkmsg=on log_buf_len=4M consoleblank=0";
 
 		/*
 		 * Live Rubens LK tag, read from

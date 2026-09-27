@@ -7,7 +7,9 @@
 #include <linux/delay.h>
 #include <linux/device/driver.h>
 #include <linux/fcntl.h>
+#include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/kmsg_dump.h>
 #include <linux/module.h>
@@ -24,7 +26,7 @@
 #define RUBENS_BOOTLOG_PAYLOAD_SIZE	(RUBENS_BOOTLOG_SLOT_SIZE - \
 					 RUBENS_BOOTLOG_HEADER_SIZE)
 #define RUBENS_BOOTLOG_SLOTS	2
-#define RUBENS_BOOTLOG_PERIOD	(10 * HZ)
+#define RUBENS_BOOTLOG_PERIOD	(2 * HZ)
 
 struct rubens_bootlog_header {
 	__le32 magic;
@@ -195,10 +197,119 @@ static bool rubens_bootlog_target_path(char *buf, size_t len)
 }
 
 /*
+ * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27): resolve the target through
+ * sysfs on the failure path.
+ *
+ * Diagnosed on the device: the oops partition is completely empty after every
+ * boot attempt, even though this driver takes a synchronous snapshot from
+ * device_initcall_sync and PARTNAME=oops really is the GPT label
+ * (/sys/class/block/sdc81/uevent -> PARTNAME=oops).  So the synchronous flush
+ * must be failing to open the device.
+ *
+ * The two existing paths both fail in an initramfs:
+ *   early_lookup_bdev()  -- only works once the UFS LUNs and the partition
+ *                           scan are done, which is not guaranteed at
+ *                           device_initcall_sync time;
+ *   /dev/disk/by-partlabel/oops -- a udev symlink, and this port boots an
+ *                           initramfs with no udev at all.
+ *
+ * This adds a third path that needs neither: walk the per-partition "uevent"
+ * files under /sys/class/block, looking for PARTNAME=<target>, then read the
+ * sibling "dev" attribute for major:minor and build the dev_t with MKDEV().
+ * Block devices and their sysfs attributes are registered by the block layer
+ * itself, so this works as soon as the partition exists, with no udev and no
+ * mounted rootfs.
+ */
+static bool rubens_bootlog_lookup_partlabel(const char *label, dev_t *out)
+{
+	static const char *const sysblock = "/sys/class/block";
+	struct file *f;
+	char buf[256];
+	char uevent[256];
+	char devpath[128];
+	char want[64];
+	unsigned int major, minor;
+	int i;
+
+	if (strncmp(label, "PARTLABEL=", 10))
+		return false;
+	snprintf(want, sizeof(want), "PARTNAME=%s", label + 10);
+
+	for (i = 0; i < 128; i++) {
+		snprintf(devpath, sizeof(devpath), "%s/sdc%d/uevent", sysblock, i);
+		f = filp_open(devpath, O_RDONLY, 0);
+		if (IS_ERR(f))
+			continue;
+		memset(uevent, 0, sizeof(uevent));
+		if (kernel_read(f, uevent, sizeof(uevent) - 1, &f->f_pos) > 0) {
+			filp_close(f, NULL);
+			if (!strstr(uevent, want))
+				continue;
+		} else {
+			filp_close(f, NULL);
+			continue;
+		}
+		snprintf(devpath, sizeof(devpath), "%s/sdc%d/dev", sysblock, i);
+		f = filp_open(devpath, O_RDONLY, 0);
+		if (IS_ERR(f))
+			continue;
+		memset(buf, 0, sizeof(buf));
+		if (kernel_read(f, buf, sizeof(buf) - 1, &f->f_pos) > 0 &&
+		    sscanf(buf, "%u:%u", &major, &minor) == 2) {
+			filp_close(f, NULL);
+			*out = MKDEV(major, minor);
+			pr_info("rubens-bootlog: %s resolved via sysfs to %u:%u\n",
+				label, major, minor);
+			return true;
+		}
+		filp_close(f, NULL);
+	}
+	return false;
+}
+
+/*
  * Resolve and open the oops partition lazily: at late_initcall the UFS LUNs
  * may not be registered yet, and a failure there must not disable the panic
  * dumper.  Called from the periodic flush and from the panic path itself.
  */
+/*
+ * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27): last-resort resolution by a
+ * fixed partition minor.
+ *
+ * Both other paths are timing-dependent and both were observed to fail on this
+ * device: early_lookup_bdev() needs the asynchronous UFS/SCSI partition scan to
+ * have completed, and the sysfs walk needs /sys/class/block to be populated.
+ * bdev_file_open_by_dev() is synchronous, so opening by dev_t directly removes
+ * every timing dependency.
+ *
+ * Values read from the live device:
+ *   /sys/class/block/sdc81/uevent -> MAJOR=259 MINOR=65 DEVNAME=sdc81
+ *   /sys/class/block/sdc81/uevent -> PARTNAME=oops
+ *   The device has 88 GPT partitions; sdc81 is the oops partition.  The minor
+ *   is allocated in disk discovery order, not by GPT index, so the measured
+ *   value (65) is used verbatim rather than derived.
+ *
+ * The major (259) is the dynamic block major the kernel hands out for
+ * partitions; sdc itself is 8:32, i.e. the fixed SCSI disk major.
+ *
+ * Overridable at boot with rubens_bootlog.devt_major / .devt_minor for other
+ * boards; setting both to 0 disables this path.
+ */
+static unsigned int rubens_bootlog_fixed_major = 259;
+static unsigned int rubens_bootlog_fixed_minor = 65;
+module_param_named(devt_major, rubens_bootlog_fixed_major, uint, 0400);
+module_param_named(devt_minor, rubens_bootlog_fixed_minor, uint, 0400);
+
+static bool rubens_bootlog_resolve_fixed(dev_t *out)
+{
+	if (!rubens_bootlog_fixed_major && !rubens_bootlog_fixed_minor)
+		return false;
+	*out = MKDEV(rubens_bootlog_fixed_major, rubens_bootlog_fixed_minor);
+	pr_info("rubens-bootlog: falling back to devt %u:%u\n",
+		rubens_bootlog_fixed_major, rubens_bootlog_fixed_minor);
+	return true;
+}
+
 static bool rubens_bootlog_open_bdev(void)
 {
 	struct rubens_bootlog_header *header;
@@ -211,6 +322,11 @@ static bool rubens_bootlog_open_bdev(void)
 
 	if (rubens_bootlog_resolve_early()) {
 		devt = rubens_bootlog_devt;
+	} else if (rubens_bootlog_lookup_partlabel(rubens_bootlog_target,
+						   &devt)) {
+		/* got it from sysfs */
+	} else if (rubens_bootlog_resolve_fixed(&devt)) {
+		/* got it from the fixed partition number */
 	} else {
 		if (!rubens_bootlog_target_path(path, sizeof(path)) ||
 		    lookup_bdev(path, &devt))
@@ -380,21 +496,37 @@ static int __init rubens_bootlog_init(void)
 	rubens_bootlog_resolve_early();
 
 	/*
-	 * Take the first snapshot synchronously: late_initcall_sync runs in
-	 * process context and committing a record before the initcalls return
-	 * maximizes the chance of capturing a crash early in userspace. The
-	 * flush reschedules itself for the periodic updates.
+	 * Take the first snapshot synchronously: running at late_initcall (see
+	 * the registration below) puts this in process context with kthreadd,
+	 * sysfs and the UFS/SCSI stack all up, and committing a record before
+	 * the initcalls return maximizes the chance of capturing a crash early
+	 * in userspace.  The flush reschedules itself for the periodic updates.
 	 */
 	rubens_bootlog_flush(NULL);
 	return 0;
 }
+
 /*
- * Arm as early as possible: device_initcall_sync runs before every late
- * initcall, so the periodic snapshot and the panic dumper are live before
- * cfg80211's regulatory init, the connectivity stack or anything else can
- * hang.  The oops partition is opened lazily.
+ * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27): registered at late_initcall
+ * instead of device_initcall_sync.
+ *
+ * Measured on the device: the oops partition stays byte-for-byte zero after
+ * every boot attempt, i.e. the first (synchronous) flush never commits.  Two
+ * things can keep it from working at device_initcall_sync level (initcall
+ * level 6):
+ *
+ *   - the sysfs fallback added above uses filp_open()/kernel_read(), which
+ *     need kthreadd and a working sysfs;
+ *   - early_lookup_bdev() only succeeds once the SCSI disk and its partitions
+ *     have been scanned, which is asynchronous.
+ *
+ * late_initcall runs at level 7, right after every level-6 driver has probed,
+ * so both are satisfied.  The device is observed to live for roughly 4 s and
+ * userland is never reached, so this is still early enough to be useful: if
+ * the partition is empty again after this change, the kernel is dying before
+ * late_initcall, and that is itself the answer.
  */
-device_initcall_sync(rubens_bootlog_init);
+late_initcall(rubens_bootlog_init);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Rubens early printk snapshot to a raw block partition");
