@@ -2523,7 +2523,14 @@ extern int mtk_wcn_wlan_func_ctrl(enum xaga_wlan_opid opId);
 static struct delayed_work wlan_nvram_defer_work;
 static struct device *wlan_nvram_dev;
 #define XAGA_NVRAM_RETRY_MS 250
-#define XAGA_NVRAM_MAX_RETRIES 480 /* ~120s */
+/*
+ * The nvram blob is copied out of the nvdata partition by the initramfs
+ * /init, so its appearance time varies between boots.  120 retries (~30s)
+ * keeps a wide margin for slow boots while cutting the worst-case retry
+ * log spam to a quarter of the original 480 (~120s): a boot that still
+ * has no nvram after 30s has bigger problems than this retry helping.
+ */
+#define XAGA_NVRAM_MAX_RETRIES 120 /* ~30s */
 #define XAGA_PWRON_RETRY_MS 3000
 #define XAGA_PWRON_MAX_RETRIES 3
 

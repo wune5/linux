@@ -525,15 +525,31 @@ static int platform_request_firmware(char *patch_name, osal_firmware **ppPatch)
 	}
 
 	*ppPatch = NULL;
-	do {
-		ret = request_firmware((const struct firmware **)&fw,
-							patch_name, NULL);
-		if (ret == -EAGAIN) {
-			pr_err("failed to open or read!(%s), retry again!\n",
-						patch_name);
+	/*
+	 * This runs from conninfra_conf_init() during early boot (~1.4s),
+	 * before the rootfs is mounted, so the file can legitimately be
+	 * missing for a while.  The original loop only retried -EAGAIN and
+	 * bailed out immediately on -ENOENT, permanently losing the config
+	 * (cfg_exist stuck at 0, "Get conf fail" spam on every power-on).
+	 * Retry every error for up to ~3s instead: the file normally lives
+	 * in the initramfs, so the first request succeeds at no cost, and
+	 * the bounded window keeps a missing file from stalling boot.
+	 */
+	{
+		int tries;
+
+		for (tries = 0; tries < 30; tries++) {
+			ret = request_firmware(
+				(const struct firmware **)&fw, patch_name,
+				NULL);
+			if (ret == 0)
+				break;
+			pr_err_ratelimited(
+				"failed to open or read!(%s), retry %d/30\n",
+				patch_name, tries + 1);
 			osal_sleep_ms(100);
 		}
-	} while (ret == -EAGAIN);
+	}
 	if (ret != 0) {
 		pr_err("failed to open or read!(%s)\n", patch_name);
 		release_firmware(fw);
